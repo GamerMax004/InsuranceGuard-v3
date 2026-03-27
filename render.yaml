@@ -1,10 +1,11 @@
-services:
+sservices:
   - type: web
     name: insuranceguard-v3
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     plan: free
+    pythonVersion: "3.12"
     envVars:
       - key: DISCORD_TOKEN
         sync: false
