@@ -11,7 +11,6 @@ import pytz
 import asyncio
 import io
 import zipfile
-import hashlib
 from typing import Optional
 
 # ═══════════════════════════════════════════════════════
@@ -151,16 +150,6 @@ def load_data() -> dict:
 def save_data(d: dict):
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(d, f, indent=4, ensure_ascii=False)
-    global _last_data_hash
-    _last_data_hash = _get_data_hash()
-
-def _get_data_hash() -> str:
-    if not os.path.exists(DATA_FILE):
-        return ""
-    with open(DATA_FILE, 'rb') as f:
-        return hashlib.md5(f.read()).hexdigest()
-
-_last_data_hash: str = ""
 
 # ═══════════════════════════════════════════════════════
 #   ID GENERATOREN
@@ -338,14 +327,71 @@ async def update_forum_thread_embed(guild: discord.Guild, customer_id: str, cust
     except Exception as e:
         logger.error(f"Fehler beim Aktualisieren des Forum-Threads: {e}")
 
+async def update_customer_thread_backup(guild: discord.Guild, customer_id: str):
+    """
+    Sendet eine JSON-Backup-Datei mit den Kundendaten in den Thread.
+    Löscht vorher die alte Backup-Datei, wenn vorhanden.
+    """
+    customer = data['customers'].get(customer_id)
+    if not customer:
+        return
+    thread_id = customer.get("thread_id")
+    if not thread_id:
+        return
+    try:
+        thread = guild.get_thread(thread_id)
+        if not thread:
+            try:
+                thread = await guild.fetch_channel(thread_id)
+            except Exception:
+                logger.warning(f"Thread {thread_id} für Backup nicht gefunden.")
+                return
+
+        # Alte Backup-Nachricht löschen
+        old_backup_msg_id = customer.get("backup_message_id")
+        if old_backup_msg_id:
+            try:
+                old_msg = await thread.fetch_message(old_backup_msg_id)
+                await old_msg.delete()
+            except Exception:
+                pass  # Nachricht bereits gelöscht oder nicht auffindbar
+
+        # Neue Backup-Datei erstellen und senden
+        backup_data = {
+            "customer_id": customer_id,
+            "exported_at": get_now().isoformat(),
+            "customer": customer
+        }
+        json_bytes = json.dumps(backup_data, indent=2, ensure_ascii=False).encode("utf-8")
+        buf = io.BytesIO(json_bytes)
+        buf.seek(0)
+        file = discord.File(buf, filename=f"akte_{customer_id}.json")
+
+        embed = discord.Embed(
+            title="<:2141file:1484250686232461352> Aktuelle Kundendaten",
+            description=f"> Diese Datei enthält den aktuellen Datenstand der Akte `{customer_id}`.\n> Sie wird bei jeder Änderung automatisch aktualisiert.",
+            color=COLOR_PRIMARY,
+            timestamp=get_now()
+        )
+        embed.add_field(name="Kunde", value=f"> `{customer.get('rp_name', '—')}`", inline=True)
+        embed.add_field(name="Stand", value=f"> {get_now().strftime('%d.%m.%Y, %H:%M Uhr')}", inline=True)
+        embed.set_footer(text="Copyright © InsuranceGuard v3", icon_url=FOOTER_ICON)
+
+        msg = await thread.send(embed=embed, file=file)
+
+        # Neue Nachrichten-ID speichern
+        data['customers'][customer_id]["backup_message_id"] = msg.id
+        save_data(data)
+        logger.info(f"Kunden-Backup für {customer_id} im Thread aktualisiert (msg {msg.id})")
+    except Exception as e:
+        logger.error(f"Fehler beim Kunden-Thread-Backup für {customer_id}: {e}", exc_info=True)
+
 # ═══════════════════════════════════════════════════════
 #   ON READY
 # ═══════════════════════════════════════════════════════
 @bot.event
 async def on_ready():
     logger.info(f'{bot.user} erfolgreich gestartet')
-    global _last_data_hash
-    _last_data_hash = _get_data_hash()
 
     bot.add_view(KundenkontaktView())
     bot.add_view(SchadensmeldungView())
@@ -1304,19 +1350,38 @@ async def create_customer(
             kunden_role = await interaction.guild.create_role(name=KUNDEN_ROLE_NAME, color=discord.Color.from_rgb(52, 152, 219))
         await user.add_roles(kunden_role)
 
+        # Alte DMs vom Bot an diesen User löschen
+        try:
+            dm_channel = await user.create_dm()
+            old_dm_ids = customer_data.get("dm_message_ids", [])
+            for old_dm_id in old_dm_ids:
+                try:
+                    old_dm_msg = await dm_channel.fetch_message(old_dm_id)
+                    await old_dm_msg.delete()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Neue DM senden und ID speichern
         dm_embed = build_kundenakte_embed(customer_id, customer_data)
         dm_embed.title = "Willkommen bei InsuranceGuard!"
         dm_embed.description = "Ihre Versicherungsakte wurde erfolgreich angelegt."
         try:
-            await user.send(embed=dm_embed)
+            dm_msg = await user.send(embed=dm_embed)
+            customer_data["dm_message_ids"] = [dm_msg.id]
         except discord.Forbidden:
             logger.warning(f"DM an {user.id} nicht möglich")
+
+        save_data(data)
 
         add_log_entry("KUNDENAKTE_ERSTELLT", interaction.user.id, {
             "customer_id": customer_id, "rp_name": rp_name,
             "versicherungen": insurance_list, "total_price": total_price,
             "thread_id": thread.thread.id, "discord_user_id": user.id
         })
+
+        await update_customer_thread_backup(interaction.guild, customer_id)
 
         log_embed = discord.Embed(title="Neue Kundenakte erstellt!", color=COLOR_SUCCESS, timestamp=get_now())
         log_embed.add_field(name="__Versicherungsnehmer__", value=f"> {rp_name}\n> `{customer_id}`", inline=False)
@@ -1416,6 +1481,8 @@ async def add_insurance_to_customer(interaction: discord.Interaction, customer_i
 
     add_log_entry("VERSICHERUNG_NACHGEBUCHT", interaction.user.id, {"customer_id": customer_id, "neue_versicherungen": new_insurances})
 
+    await update_customer_thread_backup(interaction.guild, customer_id)
+
     success = discord.Embed(title="Versicherungen nachgebucht!", color=COLOR_SUCCESS)
     success.add_field(name="__Neue Versicherungen__", value="\n".join(f"> ▸ {ins}" for ins in new_insurances), inline=False)
     success.add_field(name="__Neuer Monatsbeitrag__", value=f"> <:9654dollar:1484250776049291324> - `{new_total:,.2f} €`", inline=False)
@@ -1493,6 +1560,8 @@ async def create_invoice(interaction: discord.Interaction, customer_id: str, cha
             "invoice_id": invoice_id, "customer_id": customer_id,
             "betrag_brutto": betrag_brutto, "due_date": due_date.strftime('%d.%m.%Y')
         })
+
+        await update_customer_thread_backup(interaction.guild, customer_id)
 
         log_embed = discord.Embed(title="Neue Rechnung ausgestellt!", color=COLOR_INFO, timestamp=get_now())
         log_embed.add_field(name="Rechnungsnummer", value=f"> `{invoice_id}`", inline=False)
@@ -1583,6 +1652,8 @@ async def archive_invoice(interaction: discord.Interaction, invoice_id: str):
             "betrag": invoice['betrag'], "limit_reset": True
         })
 
+        await update_customer_thread_backup(interaction.guild, customer_id)
+
         log_embed = discord.Embed(title="Rechnung archiviert!", color=COLOR_SUCCESS, timestamp=get_now())
         log_embed.add_field(name="Rechnungsnummer", value=f"> `{invoice_id}`", inline=False)
         log_embed.add_field(name="Versicherungsnehmer", value=f"> {customer['rp_name']}\n> `{customer_id}`", inline=False)
@@ -1640,6 +1711,8 @@ async def issue_manual_reminder(interaction: discord.Interaction, invoice_id: st
         data['invoices'][invoice_id]['reminder_count'] = reminder_count
         save_data(data)
         await send_reminder(invoice_id, data['invoices'][invoice_id], reminder_count, surcharge_percent)
+
+        await update_customer_thread_backup(interaction.guild, invoice['customer_id'])
 
         success_embed = discord.Embed(title=f"{reminder_count}. Mahnung ausgestellt!", description=f"Rechnung `{invoice_id}`", color=COLOR_SUCCESS)
         success_embed.add_field(name="Neuer Betrag", value=f"> `{data['invoices'][invoice_id]['betrag']:,.2f} €`", inline=True)
@@ -1746,6 +1819,8 @@ async def archive_customer(interaction: discord.Interaction, customer_id: str):
                 await member.remove_roles(kunden_role)
 
         add_log_entry("AKTE_ARCHIVIERT", interaction.user.id, {"customer_id": customer_id, "customer_name": customer['rp_name']})
+
+        await update_customer_thread_backup(interaction.guild, customer_id)
 
         log_embed = discord.Embed(title="Kundenakte archiviert!", color=COLOR_WARNING, timestamp=get_now())
         log_embed.add_field(name="Kunden-ID", value=f"> `{customer_id}`", inline=True)
@@ -1964,6 +2039,8 @@ class AuszahlungBestaetigenModal(discord.ui.Modal, title="Auszahlung bestätigen
                 "auszahlung_id": self.auszahlung_id, "customer_id": customer_id,
                 "versicherung": versicherung, "betrag": betrag
             })
+
+            await update_customer_thread_backup(self.guild, customer_id)
 
             log_embed = discord.Embed(title="Auszahlung bestätigt!", color=COLOR_SUCCESS, timestamp=get_now())
             log_embed.add_field(name="Antrags-ID", value=f"> `{self.auszahlung_id}`", inline=False)
@@ -2561,21 +2638,16 @@ async def check_invoices():
     except Exception as e:
         logger.error(f"Fehler bei Mahnungsprüfung: {e}", exc_info=True)
 
-@tasks.loop(hours=3)
+@tasks.loop(hours=24)
 async def auto_backup():
-    global _last_data_hash
     try:
         if not config.get("log_channel_id"):
-            return
-        current_hash = _get_data_hash()
-        if current_hash == _last_data_hash:
-            logger.info("Auto-Backup: Keine Änderungen – übersprungen.")
             return
 
         timestamp_str = get_now().strftime("%Y%m%d_%H%M%S")
 
-        embed = discord.Embed(title="Automatisches Datenbank-Backup", color=COLOR_PRIMARY, timestamp=get_now())
-        embed.add_field(name="__Information__", value="> Alle `3 Stunden` werden die Daten in diesen Kanal gesichert.", inline=False)
+        embed = discord.Embed(title="<:2141file:1484250686232461352> Automatisches Datenbank-Backup", color=COLOR_PRIMARY, timestamp=get_now())
+        embed.add_field(name="__Information__", value="> Alle `24 Stunden` werden die Daten in diesen Kanal gesichert.", inline=False)
         embed.add_field(name="__Enthaltene Dateien__", value="> - `insurance_data.json`\n> - `bot_config.json`", inline=False)
         embed.add_field(name="__Zeitstempel__", value=f"> {get_now().strftime('%d.%m.%Y, %H:%M:%S Uhr')}", inline=False)
         embed.set_footer(text="Copyright © InsuranceGuard v3", icon_url=FOOTER_ICON)
@@ -2588,8 +2660,7 @@ async def auto_backup():
                 await log_channel.send(embed=embed, file=file)
                 break
 
-        _last_data_hash = current_hash
-        logger.info(f"Auto-Backup gesendet um {get_now().strftime('%H:%M:%S')}")
+        logger.info(f"Auto-Backup (24h) gesendet um {get_now().strftime('%H:%M:%S')}")
     except Exception as e:
         logger.error(f"Fehler Auto-Backup: {e}", exc_info=True)
 
